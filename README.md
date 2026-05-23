@@ -66,9 +66,24 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the state machine, transiti
 
 - Max 3 Claude ↔ Codex repair loops per PR (configurable per repo).
 - Sensitive paths (`auth/**`, `billing/**`, `migrations/**`, `.github/workflows/**`, `secrets/**`) require human review via CODEOWNERS.
-- `gitleaks` runs as a required check before merge.
+- `gitleaks` runs as a required check (`secret-scan` job) before merge — deterministic, not LLM-based.
 - New repos open in **calibration mode** — auto-merge blocked until you remove the `harness-calibrating` label.
 - All bot commits prefixed `[agent]` so they're scannable in `git log`.
+
+## Language overlays (auto-selected, no config needed)
+
+`detect_languages.sh` sniffs the repo and the PR diff, then composes the
+Codex review prompt as `BASE.md + matching overlays + your REVIEW_GUIDE.local.md`.
+Currently bundled:
+
+| Overlay | Triggers on |
+|---|---|
+| `go.md` | `go.mod` or any `*.go` |
+| `swift.md` | `Package.swift` or any `*.swift` |
+| `typescript.md` | `tsconfig.json` or any `*.ts` / `*.tsx` |
+| `python.md` | `pyproject.toml` / `requirements.txt` / `setup.py` or any `*.py` |
+
+Adding a new language is one file in `templates/review-guide/overlays/`.
 
 ## ⚠️ Cost cap is currently disabled by default
 

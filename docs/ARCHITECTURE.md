@@ -73,6 +73,7 @@ concurrency:
 |---|---|
 | `claude-implement.yml` | Owns the issue→PR transition. Stateless beyond GitHub. |
 | `codex-review-gate.yml` | Owns the review verdict. Writes labels and PR comment. |
+| `secret-scan.yml` | Runs gitleaks on the diff. Deterministic; fails the check on any leak. |
 | `claude-fix-from-codex.yml` | Owns the fix loop. Reads labels, checks guards, runs Claude. |
 | `auto-merge.yml` | Owns the merge decision. Reads all labels + checks; takes no other action. |
 | `agent_loop_guard.py` | The only writer of the loop-count marker comment. |

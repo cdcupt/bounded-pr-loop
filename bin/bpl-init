@@ -113,6 +113,7 @@ if [[ -n "$REPO_SLUG" ]]; then
     -H "Accept: application/vnd.github+json" \
     -f required_status_checks.strict=true \
     -f required_status_checks.contexts[]="review" \
+    -f required_status_checks.contexts[]="secret-scan" \
     -f enforce_admins=false \
     -f required_pull_request_reviews.require_code_owner_reviews=true \
     -f required_pull_request_reviews.required_approving_review_count=0 \

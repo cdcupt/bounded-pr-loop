@@ -34,6 +34,12 @@ jobs:
     with:
       pr_number: ${{ github.event.pull_request.number }}
 
+  secret-scan:
+    if: github.event_name == 'pull_request'
+    uses: cdcupt/bounded-pr-loop/.github/workflows/secret-scan.yml@v1
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+
   fix:
     if: >-
       github.event_name == 'pull_request' &&
