@@ -70,13 +70,30 @@ copy_template() {
 
 # ───────── LOCAL MODE ─────────
 if [[ "$MODE" == "local" ]]; then
-  echo "▶ Local mode — drops .bpl.yml only. No CLAUDE.md, no workflows."
+  echo "▶ Local mode — drops .bpl.yml; installs the bpl skill globally."
   copy_template "${TEMPLATES}/.bpl.yml.tmpl" ".bpl.yml"
+
+  # ── Install the skill into ~/.claude/skills/ (symlink so updates propagate)
+  SKILL_SRC="${THIS_DIR}/skills/bpl"
+  SKILL_DST="${HOME}/.claude/skills/bpl"
+  mkdir -p "${HOME}/.claude/skills"
+  if [[ -L "$SKILL_DST" && "$(readlink "$SKILL_DST")" == "$SKILL_SRC" ]]; then
+    echo "  · ~/.claude/skills/bpl already symlinked"
+  elif [[ -e "$SKILL_DST" ]]; then
+    BACKUP="${SKILL_DST}.bak.$(date +%s)"
+    echo "  · ~/.claude/skills/bpl exists; moving to ${BACKUP}"
+    mv "$SKILL_DST" "$BACKUP"
+    ln -s "$SKILL_SRC" "$SKILL_DST"
+    echo "  ✓ ~/.claude/skills/bpl → ${SKILL_SRC}"
+  else
+    ln -s "$SKILL_SRC" "$SKILL_DST"
+    echo "  ✓ ~/.claude/skills/bpl → ${SKILL_SRC}"
+  fi
 
   # Verify CLIs exist; warn if missing
   for cli in claude codex gh; do
     if ! command -v "$cli" > /dev/null; then
-      echo "  ⚠️  \`$cli\` not on PATH. Install before running bpl-run."
+      echo "  ⚠️  \`$cli\` not on PATH. Install before running the loop."
     fi
   done
 
@@ -84,17 +101,22 @@ if [[ "$MODE" == "local" ]]; then
 
 ✅ Local harness installed.
 
-Next steps:
-  1. Make sure ~/CLAUDE.md exists (it's your global agent guide).
-     Both \`claude\` and \`codex\` read it (via ~/AGENTS.md → CLAUDE.md symlink).
-  2. Optionally edit .bpl.yml — loop limit, sensitive paths, model overrides.
-  3. File an issue:
-       gh issue create -t "Add /healthz endpoint" -b "Description here"
-  4. Run the loop:
+How to use it (preferred — Claude does the work for you):
+  1. Start a Claude Code session in this repo.
+  2. Just describe the task: "Add /healthz endpoint", "Fix the off-by-one
+     in foo()", "Implement issue #42", etc.
+  3. Claude detects the task is BPL-shaped and invokes the \`bpl\` skill,
+     which walks through implement → PR → Codex review → fix → merge.
+
+Manual fallback (terminal-only, no Claude session needed):
+       gh issue create -t "Add /healthz endpoint" -b "Description"
        ${THIS_DIR}/bin/bpl-run <issue-number>
 
-Calibration mode is ON by default — auto-merge is disabled until you set
-\`calibration_mode: false\` in .bpl.yml or pass --auto-merge manually.
+Make sure ~/CLAUDE.md exists — it's the single source of truth read by
+both \`claude\` and \`codex\` (via the ~/AGENTS.md → CLAUDE.md symlink).
+
+Calibration mode is ON by default — auto-merge is disabled until you flip
+\`calibration_mode: false\` in .bpl.yml.
 EOF
   exit 0
 fi

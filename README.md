@@ -1,37 +1,56 @@
 # bounded-pr-loop
 
-A bounded, auditable loop where **Claude implements**, **Codex reviews**, and you merge only when both agree. Two modes:
-
-- **Local** *(default, recommended)* — runs on your Mac via your Claude Code + Codex **subscriptions**. No API keys, no recurring cost. One `~/CLAUDE.md` is the global source of truth; no per-project CLAUDE.md needed.
-- **CI** — same loop, running in GitHub Actions. Requires `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` (or an OpenRouter key routed via `*_BASE_URL` overrides). Pay-per-call.
+A bounded, auditable loop where **Claude implements**, **Codex reviews**, and you merge only when both agree.
 
 ```text
                         ┌──────────────────┐
                         │ ≤ 3 repair loops │
                         └──────────────────┘
-issue → Claude implements → Codex reviews ──FAIL──► Claude fixes ──┐
-                                  │                                 │
-                                 PASS  ◄──────────────────────────  ┘
+task  →  Claude writes  →  Codex reviews  ──FAIL──►  Claude fixes ──┐
+                                  │                                  │
+                                 PASS  ◄───────────────────────────  ┘
                                   │
                                   ▼
-                       open PR ─► you (or CI) merge
+                        open PR  ─►  you merge
 ```
 
-## Quickstart — local mode
+Three ways to invoke it, in priority order:
+
+| Mode | When to use | Auth | Cost |
+|---|---|---|---|
+| **Skill** *(default, recommended)* | Inside a Claude Code session — just describe a task and Claude invokes the `bpl` skill, which walks itself through the 5 phases using Bash/Edit/Write. | Subscription | $0 |
+| **`bpl-run` CLI** | From a terminal without a Claude session (CI hooks, scripts, cron). | Subscription | $0 |
+| **GitHub Actions** | Unattended, issue-label-and-walk-away. Triggered by labeling a GitHub issue `claude-implement`. | API key (or OpenRouter via `*_BASE_URL`) | Pay-per-call |
+
+## Quickstart — skill mode (preferred)
 
 ```bash
-# one-time setup of a repo:
+# one-time per repo:
 cd ~/codes/github.com/<your-repo>
-~/codes/github.com/bounded-pr-loop/bin/bpl-init     # drops .bpl.yml only
+~/codes/github.com/bounded-pr-loop/bin/bpl-init    # drops .bpl.yml + symlinks the skill into ~/.claude/skills/bpl/
+```
 
-# for any task:
+Then in any Claude Code session inside that repo, just describe what you want:
+
+> "Add a `/healthz` endpoint that returns `200 OK`."
+>
+> "Fix the off-by-one in `calculateTotal()`."
+>
+> "Implement issue #42."
+
+Claude detects the task is BPL-shaped, invokes the skill, and you watch the 5 phases run. The skill is the single source of behavior — Claude reads it, follows it, and asks before doing anything risky.
+
+## Quickstart — `bpl-run` CLI (fallback for terminal-only)
+
+```bash
+cd ~/codes/github.com/<your-repo>
 gh issue create -t "Add /healthz endpoint" -b "Description here"
 ~/codes/github.com/bounded-pr-loop/bin/bpl-run <issue-number>
 ```
 
-`bpl-run` reads `~/CLAUDE.md` (global) + optional `./CLAUDE.md` (project-specific only if you need it), runs `claude` then `codex`, loops up to 3 times, opens a PR. Costs $0 above your existing subscriptions.
+Same 5-phase loop, but driven by Python instead of by Claude inside a session. Useful when you want to run BPL from cron or a script.
 
-## Quickstart — CI mode (only if you want unattended GitHub-Actions-driven runs)
+## Quickstart — CI / GitHub Actions mode (only for unattended automation)
 
 ```bash
 gh secret set ANTHROPIC_API_KEY --user
