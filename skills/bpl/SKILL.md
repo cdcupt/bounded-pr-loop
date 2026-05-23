@@ -80,31 +80,43 @@ If the user asked to create a new project:
 
 ## Phase 3 — Codex review
 
-1. Compose the review prompt:
-   ```
-   <BASE.md content>
-   <each detected overlay's content>
-   <REVIEW_GUIDE.local.md if present>
+1. Compose the review prompt by concatenating, in this order:
+   - `BASE.md` content
+   - each detected language overlay's content
+   - `REVIEW_GUIDE.local.md` if present
+   - `---`
+   - `## PR diff to review` heading
+   - a fenced ` ```diff ` block containing `git diff main...<branch>` output
 
-   ---
-
-   ## PR diff to review
-
-   ```diff
-   <output of `git diff main...<branch>`>
-   ```
-   ```
-2. Write the prompt to `/tmp/bpl_review_prompt.md`.
-3. Run Codex non-interactively:
+   Write it to `/tmp/bpl_review_prompt.md`. Bash heredoc pattern:
    ```bash
-   codex exec --model o4-mini < /tmp/bpl_review_prompt.md > /tmp/bpl_codex_out.txt 2>&1 || true
+   {
+     cat ~/codes/github.com/bounded-pr-loop/templates/review-guide/BASE.md
+     # …append overlays + local guide here if applicable
+     echo; echo "---"; echo
+     echo "## PR diff to review"; echo
+     echo '```diff'
+     git diff main...<branch>
+     echo '```'
+   } > /tmp/bpl_review_prompt.md
    ```
-   (Codex may exit non-zero on FAIL verdicts — don't treat that as a script failure.)
-4. **Parse the verdict.** Look for a case-insensitive line matching `verdict:\s*(pass|fail)`. Use the **last** match. If no verdict is found, treat as FAIL with the meta-finding "Could not parse VERDICT line from Codex output."
-5. **Extract findings.** From a `## Blocking findings` section, pull each bullet (`- ` or `* `) as a separate finding.
-6. **Post the Codex review as a PR comment** so the audit trail is in GitHub, not just in `/tmp`. Prefix the comment body with `<!-- bpl-codex-review -->` so later phases can update the same comment instead of stacking them:
+
+2. **Run Codex non-interactively with `codex exec -` (literal `-` for stdin):**
    ```bash
-   gh pr comment <pr#> --body "<formatted review>"
+   codex exec - < /tmp/bpl_review_prompt.md > /tmp/bpl_codex_out.txt 2>&1
+   ```
+   - Use `-` as the explicit prompt argument; pure shell redirection without `-` does not always reach the prompt parser.
+   - **Do NOT use `codex exec review --base main` with a custom prompt** — `--base` and `[PROMPT]` are mutually exclusive at runtime despite what `--help` suggests. Use the manual-diff form above and Codex will see exactly the diff you give it.
+   - The `--model` flag is optional; Codex picks a reasonable default. Only override (`-c model="o3"`) when a specific repo needs more rigor.
+   - Codex may exit non-zero on FAIL verdicts — don't treat that as a script failure. Drop `|| true` from the pipeline only if you want to detect *crash* failures separately.
+
+3. **Parse the verdict.** Look for a case-insensitive line matching `verdict:\s*(pass|fail)`. Use the **last** match. If no verdict is found, treat as FAIL with the meta-finding "Could not parse VERDICT line from Codex output."
+
+4. **Extract findings.** From a `## Blocking findings` section, pull each bullet (`- ` or `* `) as a separate finding. The Codex stdout will also include the prompt echoed back and a `tokens used` footer — ignore both when parsing.
+
+5. **Post the Codex review as a PR comment** so the audit trail is in GitHub, not just in `/tmp`. Prefix the comment body with `<!-- bpl-codex-review -->` so later phases can update the same comment instead of stacking them. Write the comment body to a file (don't try to inline it on the command line — it usually contains markdown that breaks shell quoting):
+   ```bash
+   gh pr comment <pr#> --body-file /tmp/bpl_pr_comment.md
    ```
 
 ## Phase 4 — Address findings
@@ -158,6 +170,10 @@ Look at the verdict from Phase 3.
 - Review-guide overlays: `~/codes/github.com/bounded-pr-loop/templates/review-guide/overlays/`.
 - Fallback orchestrator for terminal use without Claude in a session: `~/codes/github.com/bounded-pr-loop/bin/bpl-run`.
 - Memory note: `bounded-pr-loop` in `~/.claude/projects/-Users-erik/memory/`.
+
+## Validation
+
+End-to-end smoke-tested 2026-05-17 against `cdcupt/bpl-sandbox` PR #1 (add MIT LICENSE). All 5 phases ran; Codex returned `VERDICT: PASS` on first review; review posted to PR. `codex exec - < prompt.md` confirmed working with subscription auth. The `codex exec review --base` form was tried and rejected — see Phase 3 notes for why.
 
 ## Telling the user what's happening
 
