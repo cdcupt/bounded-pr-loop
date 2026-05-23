@@ -1,0 +1,66 @@
+name: Reusable — Auto Merge
+# Squash-merges when ALL of:
+#   - codex-pass label present
+#   - no codex-fail, needs-human, security-sensitive, harness-calibrating labels
+#   - all required checks green
+#   - no sensitive paths touched
+# Never overrides branch protection or CODEOWNERS.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: number
+        required: false
+        default: 0
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ inputs.pr_number }}"
+          if [ "$PR" = "0" ] || [ -z "$PR" ]; then
+            # Triggered by check_suite — find associated PR
+            SHA="${{ github.event.check_suite.head_sha }}"
+            PR=$(gh api "repos/${{ github.repository }}/commits/${SHA}/pulls" \
+              --jq 'first(.[] | select(.state == "open")) | .number')
+          fi
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "No open PR for this event; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate gates
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.pr }}
+        run: |
+          python3 scripts/agent_loop_guard.py merge-eligible \
+            --pr     "$PR" \
+            --repo   "${{ github.repository }}" \
+            --config .harness.yml
+
+      - name: Squash merge
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr merge "${{ steps.pr.outputs.pr }}" \
+            --squash --delete-branch \
+            --subject "[agent] $(gh pr view ${{ steps.pr.outputs.pr }} --json title -q .title)"

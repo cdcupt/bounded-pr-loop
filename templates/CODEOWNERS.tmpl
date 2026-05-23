@@ -1,0 +1,21 @@
+# CODEOWNERS for bounded-pr-loop consumer repos.
+# A change touching any of these paths cannot be merged (even by the harness)
+# until @{{OWNER}} approves the review. This is enforced by branch
+# protection, not by workflow code, so a buggy script cannot bypass it.
+
+# Defaults — anything not matched falls through with no owner requirement.
+
+# Workflow definitions: an agent must never silently rewrite its own rails.
+/.github/workflows/   @{{OWNER}}
+/.github/CODEOWNERS   @{{OWNER}}
+
+# Security-sensitive code paths (matches sensitive_paths in .harness.yml).
+/auth/                @{{OWNER}}
+/billing/             @{{OWNER}}
+/migrations/          @{{OWNER}}
+/secrets/             @{{OWNER}}
+
+# Anything declared CHANGELOG-affecting or release-affecting.
+/.harness.yml         @{{OWNER}}
+/CLAUDE.md            @{{OWNER}}
+/REVIEW_GUIDE.local.md @{{OWNER}}

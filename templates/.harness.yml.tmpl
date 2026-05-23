@@ -1,0 +1,26 @@
+# Per-project harness config. Anything not set here falls back to the
+# defaults inside bounded-pr-loop's scripts.
+
+# Maximum number of Claude→Codex repair cycles before the PR is handed to a human.
+loop_count_max: 3
+
+# Cost ceilings. `null` = log-only (NO ENFORCEMENT). Set to a positive number
+# to fail-closed when the running total for a PR or day exceeds the value.
+cost_cap_per_pr_usd: null
+cost_cap_per_day_usd: null
+
+# Glob patterns. If a PR touches any of these, the harness adds the
+# `security-sensitive` label and refuses to auto-merge. Combined with
+# CODEOWNERS, this means a human must review them.
+sensitive_paths:
+  - .github/workflows/**
+  - "**/auth/**"
+  - "**/billing/**"
+  - "**/migrations/**"
+  - "**/secrets/**"
+
+# While true: even a fully-green PR is NOT auto-merged. You merge manually.
+# Use this for the first ~10 PRs to calibrate REVIEW_GUIDE.local.md without
+# letting the loop ship anything you didn't read.
+# Flip to false (or remove the `harness-calibrating` label) once you trust it.
+calibration_mode: true

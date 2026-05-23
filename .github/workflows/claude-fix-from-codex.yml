@@ -1,0 +1,115 @@
+name: Reusable — Claude Fix From Codex
+# Triggered when `codex-fail` label is applied on a PR.
+# Increments loop counter, checks all guards, runs Claude to fix only the
+# blocking findings, pushes a new commit.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: number
+        required: true
+      claude_model:
+        type: string
+        required: false
+        default: claude-sonnet-4-6
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: claude-fix-${{ inputs.pr_number }}
+  cancel-in-progress: false  # don't kill an in-flight fix
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/pull/${{ inputs.pr_number }}/head
+
+      - name: Loop guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/agent_loop_guard.py check \
+            --pr     "${{ inputs.pr_number }}" \
+            --repo   "${{ github.repository }}" \
+            --config .harness.yml \
+            || { echo "Guard failed — see comment on PR."; exit 78; }
+          # exit 78 = neutral (no failure, no success) — keeps the run quiet
+
+      - name: Increment loop counter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/agent_loop_guard.py increment \
+            --pr   "${{ inputs.pr_number }}" \
+            --repo "${{ github.repository }}"
+
+      - name: Fetch latest Codex findings
+        id: findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The review gate posts findings as a comment with a stable marker.
+          gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments \
+            --jq '[.[] | select(.body | startswith("<!-- codex-review -->"))] | last | .body' \
+            > /tmp/findings.md
+          if [ ! -s /tmp/findings.md ]; then
+            echo "::error::No Codex review comment found"
+            exit 1
+          fi
+
+      - name: Build fix prompt
+        run: |
+          cat > /tmp/fix_prompt.md <<'EOF'
+          You are fixing a pull request based on a Codex review.
+
+          # Rules
+
+          1. Fix ONLY the blocking findings listed below. Do not refactor unrelated code.
+          2. Do not expand the scope of the original change.
+          3. Run the project's tests if they exist; do not push if they fail.
+          4. Commit messages must start with "[agent] fix:".
+
+          # Codex review
+          EOF
+          cat /tmp/findings.md >> /tmp/fix_prompt.md
+
+      - name: Configure git
+        run: |
+          git config user.name  "bounded-pr-loop[bot]"
+          git config user.email "bounded-pr-loop@users.noreply.github.com"
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: ${{ inputs.claude_model }}
+          prompt_file: /tmp/fix_prompt.md
+
+      - name: Commit + push fix
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::warning::Claude made no changes; nothing to push"
+            exit 0
+          fi
+          git add -A
+          git commit -m "[agent] fix: address Codex blocking findings"
+          git push
+
+      - name: Remove codex-fail label so re-review triggers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr edit "${{ inputs.pr_number }}" --remove-label codex-fail

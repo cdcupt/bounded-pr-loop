@@ -1,0 +1,120 @@
+name: Reusable — Codex Review Gate
+# Triggered on PR open/sync from a consumer repo.
+# Runs Codex CLI against the diff with a language-aware review checklist,
+# parses PASS/FAIL, labels the PR, and writes a comment with findings.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: number
+        required: true
+      codex_model:
+        type: string
+        required: false
+        default: o4-mini
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+
+concurrency:
+  group: codex-review-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR head + base
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr view "${{ inputs.pr_number }}" --json baseRefOid,headRefOid,files,labels \
+            > /tmp/pr.json
+          jq -r '.baseRefOid' /tmp/pr.json > /tmp/base.txt
+          jq -r '.headRefOid' /tmp/pr.json > /tmp/head.txt
+          echo "base=$(cat /tmp/base.txt)" >> "$GITHUB_OUTPUT"
+          echo "head=$(cat /tmp/head.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Detect languages from diff
+        id: lang
+        run: |
+          git diff --name-only "${{ steps.pr.outputs.base }}..${{ steps.pr.outputs.head }}" \
+            > /tmp/changed.txt
+          # Pulls detect_languages.sh from the harness repo (this workflow runs FROM that repo)
+          bash "${GITHUB_WORKSPACE}/scripts/detect_languages.sh" \
+            --files /tmp/changed.txt \
+            --repo  "${GITHUB_WORKSPACE}" \
+            > /tmp/languages.txt
+          echo "list=$(cat /tmp/languages.txt)" >> "$GITHUB_OUTPUT"
+          echo "Detected languages: $(cat /tmp/languages.txt)"
+
+      - name: Build review prompt
+        run: |
+          OUT=/tmp/review_prompt.md
+          cat templates/review-guide/BASE.md > "$OUT"
+          for lang in $(echo "${{ steps.lang.outputs.list }}" | tr ',' ' '); do
+            FILE="templates/review-guide/overlays/${lang}.md"
+            if [ -f "$FILE" ]; then
+              echo -e "\n\n## Overlay: ${lang}\n" >> "$OUT"
+              cat "$FILE" >> "$OUT"
+            fi
+          done
+          if [ -f REVIEW_GUIDE.local.md ]; then
+            echo -e "\n\n## Repo-local guidance\n" >> "$OUT"
+            cat REVIEW_GUIDE.local.md >> "$OUT"
+          fi
+          echo -e "\n\n---\n\n## PR diff to review\n\n\`\`\`diff" >> "$OUT"
+          git diff "${{ steps.pr.outputs.base }}..${{ steps.pr.outputs.head }}" >> "$OUT"
+          echo -e "\n\`\`\`" >> "$OUT"
+
+      - name: Install Codex CLI
+        run: |
+          npm install -g @openai/codex
+          codex --version
+
+      - name: Run Codex review
+        id: codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Codex CLI in non-interactive review mode; stdout captured for parsing.
+          codex \
+            --model "${{ inputs.codex_model }}" \
+            --no-color \
+            --prompt-file /tmp/review_prompt.md \
+            > /tmp/codex_output.txt 2>&1 || true
+          echo "Codex output length: $(wc -c < /tmp/codex_output.txt) bytes"
+
+      - name: Parse verdict + post review
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 scripts/codex_review_gate.py \
+            --pr     "$PR_NUMBER" \
+            --output /tmp/codex_output.txt \
+            --repo   "${{ github.repository }}"
+
+      - name: Log spend (no enforcement by default)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          python3 scripts/cost_tracker.py \
+            --pr     "$PR_NUMBER" \
+            --source codex \
+            --input  /tmp/codex_output.txt

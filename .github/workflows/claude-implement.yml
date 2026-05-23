@@ -1,0 +1,113 @@
+name: Reusable — Claude Implement
+# Triggered by a consumer repo when an issue gets the `claude-implement` label.
+# Reads the issue, creates a branch, implements, opens a PR.
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        type: number
+        required: true
+      claude_model:
+        type: string
+        required: false
+        default: claude-sonnet-4-6
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load harness config
+        id: cfg
+        run: |
+          if [ -f .harness.yml ]; then
+            python3 -c "
+          import yaml, json, sys, pathlib
+          cfg = yaml.safe_load(pathlib.Path('.harness.yml').read_text()) or {}
+          out = {
+            'calibration_mode': bool(cfg.get('calibration_mode', True)),
+            'sensitive_paths': cfg.get('sensitive_paths', []),
+          }
+          print('cfg=' + json.dumps(out))
+          " >> "$GITHUB_OUTPUT"
+          else
+            echo 'cfg={"calibration_mode": true, "sensitive_paths": []}' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue view "${{ inputs.issue_number }}" --json title,body,number,labels \
+            > /tmp/issue.json
+          jq -r '.title' /tmp/issue.json > /tmp/title.txt
+          # branch slug: lowercase, alnum + hyphens, max 40 chars
+          SLUG=$(cat /tmp/title.txt | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g' | cut -c1-40)
+          BRANCH="agent/issue-${{ inputs.issue_number }}-${SLUG}"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "title=$(cat /tmp/title.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git
+        run: |
+          git config user.name  "bounded-pr-loop[bot]"
+          git config user.email "bounded-pr-loop@users.noreply.github.com"
+          git checkout -b "${{ steps.issue.outputs.branch }}"
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: ${{ inputs.claude_model }}
+          prompt_file: /tmp/implementation_prompt.md
+          # The action streams stdout but does not push commits itself;
+          # we use a wrapper to keep behavior consistent across versions.
+        continue-on-error: false
+        env:
+          ISSUE_JSON: /tmp/issue.json
+
+      - name: Verify the agent actually changed something
+        id: diff
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::error::Claude produced no changes for issue #${{ inputs.issue_number }}"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit
+        run: |
+          git add -A
+          git commit -m "[agent] implement: ${{ steps.issue.outputs.title }}
+
+          Closes #${{ inputs.issue_number }}"
+          git push -u origin "${{ steps.issue.outputs.branch }}"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --title "[agent] ${{ steps.issue.outputs.title }}" \
+            --body "Closes #${{ inputs.issue_number }}
+
+          <!-- loop_count: 0 -->
+
+          Implemented by bounded-pr-loop. See Codex review below." \
+            --label harness-calibrating \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "${{ steps.issue.outputs.branch }}"

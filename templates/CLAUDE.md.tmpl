@@ -1,0 +1,96 @@
+# {{PROJECT_NAME}} — Agent guide
+
+> This file is read by both Claude Code and Codex (via the symlink `AGENTS.md → CLAUDE.md`).
+> Keep it short, factual, and current. If something changes, update this file in the same PR.
+
+## What this project is
+
+<!-- One paragraph. What it does, who uses it, the primary language. -->
+
+## How to build & test
+
+```bash
+# Replace with the real commands for this project.
+```
+
+## How to run locally
+
+```bash
+# Replace with the real commands.
+```
+
+## Project layout
+
+<!-- Two or three sentences. Where the entry point is, where tests live, anything non-obvious. -->
+
+---
+
+## Agent behavior rules (bounded-pr-loop)
+
+These rules apply to **all automated work** in this repo. Both Claude and
+Codex must follow them. Violations cause the review gate to FAIL.
+
+### 1. Scope discipline
+
+- Implement only what the issue asks for. Do not refactor unrelated code in
+  the same PR, even if it is tempting.
+- If a change requires touching adjacent code to compile, do it minimally and
+  call it out in the PR description.
+
+### 2. Tests
+
+- Add at least one test for new behavior unless the change is purely
+  cosmetic (formatting, comments, docs).
+- Run the project's test command before pushing. Do not push if tests fail.
+
+### 3. PR hygiene
+
+- PR description must include `Closes #<issue-number>` so the originating
+  issue auto-closes on merge.
+- Commit messages start with `[agent]` followed by a conventional-commit
+  type: `[agent] feat:`, `[agent] fix:`, `[agent] docs:`, etc.
+- Keep each commit reviewable in isolation.
+
+### 4. Fix loops
+
+- When fixing a Codex review, address **only** the listed blocking findings.
+- Do not add new functionality during a fix loop.
+- If you cannot fix a finding without breaking scope rule (1), say so in a
+  PR comment and stop — the harness will hand off to a human.
+
+### 5. Sensitive paths (hard stop)
+
+Do not modify these paths in an automated PR. The harness will block the
+merge anyway, but flagging early saves a loop iteration:
+
+- `.github/workflows/**`
+- `**/auth/**`
+- `**/billing/**`
+- `**/migrations/**`
+- `**/secrets/**`
+
+Anything beyond this list that you suspect is sensitive: stop and ask.
+
+### 6. Secrets
+
+- Never commit API keys, tokens, passwords, private keys, or production
+  configuration. `gitleaks` runs on every PR and will block the merge if it
+  finds something, but you should never write one in the first place.
+- Reference secrets via environment variables; assume they are present.
+
+### 7. Documentation
+
+- If a public-facing behavior changes, update this file or the relevant doc
+  in the same PR. A PR that changes behavior without updating its docs is
+  failing rule (1) — scope is incomplete, not minimal.
+
+---
+
+## Repo-local additions
+
+<!-- Anything specific to THIS project that an agent should know.
+     Examples:
+       - "Use `pnpm`, not npm."
+       - "Database is Postgres; migrations live in db/migrations."
+       - "All public APIs use the envelope in pkg/response."
+-->
