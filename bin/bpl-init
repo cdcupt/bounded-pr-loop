@@ -1,59 +1,59 @@
 #!/usr/bin/env bash
 # bpl-init — bootstrap any repo to use the bounded-pr-loop harness.
 #
-# Run this from inside the repo you want to onboard.
+# Two modes:
+#   --local (default)  No GitHub Actions. Uses bpl-run on your Mac with your
+#                      Claude Code + Codex subscriptions. No per-repo CLAUDE.md
+#                      required; reads ~/CLAUDE.md as the global source.
+#   --ci               GitHub Actions reusable-workflow setup. Requires
+#                      ANTHROPIC_API_KEY + OPENAI_API_KEY as user-level secrets.
+#                      Drops CLAUDE.md + AGENTS.md + .harness.yml + harness.yml.
+#
 # Safe to re-run; existing files are not clobbered without --force.
 
 set -euo pipefail
 
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATES="${THIS_DIR}/templates"
-OWNER="${BPL_OWNER:-cdcupt}"   # override with BPL_OWNER=... bpl-init
+OWNER="${BPL_OWNER:-cdcupt}"
+MODE="local"
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --local) MODE="local"; shift ;;
+    --ci)    MODE="ci"; shift ;;
     --force) FORCE=1; shift ;;
     --owner) OWNER="$2"; shift 2 ;;
     -h|--help)
       cat <<EOF
-Usage: bpl-init [--force] [--owner <github-handle>]
+Usage: bpl-init [--local | --ci] [--force] [--owner <github-handle>]
 
-Drops harness files into the current repo:
-  .github/workflows/harness.yml   — 30-line stub that calls bounded-pr-loop
-  .harness.yml                    — per-project config (loop limit, sensitive paths)
-  CLAUDE.md                       — agent guide (skeleton if absent)
-  AGENTS.md                       — symlink to CLAUDE.md (Codex compatibility)
-  CODEOWNERS                      — sensitive-path owners
+  --local (default)
+      No GitHub Actions. Drops .bpl.yml only. Use \`bpl-run <issue#>\`
+      from inside the repo to run the loop locally with your Claude Code
+      and Codex subscriptions. No per-repo CLAUDE.md; reads ~/CLAUDE.md.
 
-Then via gh:
-  • creates labels (claude-implement, codex-pass, codex-fail, needs-human,
-    security-sensitive, harness-calibrating)
-  • configures branch protection on the default branch
+  --ci
+      GitHub Actions setup. Drops .github/workflows/harness.yml,
+      .harness.yml, CLAUDE.md, AGENTS.md, CODEOWNERS. Creates labels and
+      branch protection via gh. Requires ANTHROPIC_API_KEY and
+      OPENAI_API_KEY as user-level GitHub secrets.
+
+  --owner GITHUB_HANDLE
+      Used in CODEOWNERS (CI mode). Default: \$BPL_OWNER or "cdcupt".
 EOF
       exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-# ───────── sanity ─────────
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
-  echo "❌ Not inside a git repo. Run \`git init\` (or cd into a repo) first." >&2
+  echo "❌ Not inside a git repo." >&2
   exit 1
 fi
-if ! command -v gh > /dev/null; then
-  echo "❌ \`gh\` not on PATH. Install: https://cli.github.com/" >&2
-  exit 1
-fi
-
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
-
-# Derive repo slug if pushed; otherwise punt to user later.
-REPO_SLUG=""
-if git remote get-url origin > /dev/null 2>&1; then
-  REPO_SLUG=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
-fi
 
 copy_template() {
   local src="$1" dst="$2"
@@ -62,42 +62,73 @@ copy_template() {
     return
   fi
   mkdir -p "$(dirname "$dst")"
-  # Substitute {{OWNER}} and {{PROJECT_NAME}}
   local proj
   proj=$(basename "$REPO_ROOT")
   sed -e "s/{{OWNER}}/${OWNER}/g" -e "s/{{PROJECT_NAME}}/${proj}/g" "$src" > "$dst"
   echo "  ✓ $dst"
 }
 
-echo "▶ Writing harness files…"
+# ───────── LOCAL MODE ─────────
+if [[ "$MODE" == "local" ]]; then
+  echo "▶ Local mode — drops .bpl.yml only. No CLAUDE.md, no workflows."
+  copy_template "${TEMPLATES}/.bpl.yml.tmpl" ".bpl.yml"
+
+  # Verify CLIs exist; warn if missing
+  for cli in claude codex gh; do
+    if ! command -v "$cli" > /dev/null; then
+      echo "  ⚠️  \`$cli\` not on PATH. Install before running bpl-run."
+    fi
+  done
+
+  cat <<EOF
+
+✅ Local harness installed.
+
+Next steps:
+  1. Make sure ~/CLAUDE.md exists (it's your global agent guide).
+     Both \`claude\` and \`codex\` read it (via ~/AGENTS.md → CLAUDE.md symlink).
+  2. Optionally edit .bpl.yml — loop limit, sensitive paths, model overrides.
+  3. File an issue:
+       gh issue create -t "Add /healthz endpoint" -b "Description here"
+  4. Run the loop:
+       ${THIS_DIR}/bin/bpl-run <issue-number>
+
+Calibration mode is ON by default — auto-merge is disabled until you set
+\`calibration_mode: false\` in .bpl.yml or pass --auto-merge manually.
+EOF
+  exit 0
+fi
+
+# ───────── CI MODE (requires API keys) ─────────
+if ! command -v gh > /dev/null; then
+  echo "❌ \`gh\` required for --ci mode." >&2
+  exit 1
+fi
+
+REPO_SLUG=""
+if git remote get-url origin > /dev/null 2>&1; then
+  REPO_SLUG=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+fi
+
+echo "▶ CI mode — writing GitHub Actions harness files…"
 copy_template "${TEMPLATES}/harness.yml.tmpl"    ".github/workflows/harness.yml"
 copy_template "${TEMPLATES}/.harness.yml.tmpl"   ".harness.yml"
 copy_template "${TEMPLATES}/CODEOWNERS.tmpl"     "CODEOWNERS"
 
 if [[ ! -e "CLAUDE.md" || $FORCE -eq 1 ]]; then
   copy_template "${TEMPLATES}/CLAUDE.md.tmpl" "CLAUDE.md"
-else
-  echo "  · CLAUDE.md exists; leaving as-is"
 fi
 
-# AGENTS.md ↔ CLAUDE.md symlink (relative target → portable)
 if [[ ! -e "AGENTS.md" ]]; then
   ln -s CLAUDE.md AGENTS.md
   echo "  ✓ AGENTS.md → CLAUDE.md"
-elif [[ -L "AGENTS.md" && "$(readlink AGENTS.md)" == "CLAUDE.md" ]]; then
-  echo "  · AGENTS.md already symlinked correctly"
-else
-  echo "  · AGENTS.md exists and is not the right symlink; skipping"
 fi
 
-# ───────── labels (idempotent) ─────────
 if [[ -n "$REPO_SLUG" ]]; then
   echo "▶ Creating labels on $REPO_SLUG…"
   create_label() {
-    local name="$1" color="$2" desc="$3"
-    gh label create "$name" --color "$color" --description "$desc" --repo "$REPO_SLUG" 2>/dev/null \
-      && echo "  ✓ $name" \
-      || echo "  · $name exists"
+    gh label create "$1" --color "$2" --description "$3" --repo "$REPO_SLUG" 2>/dev/null \
+      && echo "  ✓ $1" || echo "  · $1 exists"
   }
   create_label claude-implement     0E8A16 "Trigger Claude to implement this issue"
   create_label codex-pass           5319E7 "Codex review passed (auto)"
@@ -106,7 +137,6 @@ if [[ -n "$REPO_SLUG" ]]; then
   create_label security-sensitive   B60205 "Touches sensitive paths; requires human review"
   create_label harness-calibrating  FBCA04 "Calibration mode; manual merge only"
 
-  # ───────── branch protection ─────────
   DEFAULT_BRANCH=$(gh repo view "$REPO_SLUG" --json defaultBranchRef --jq .defaultBranchRef.name)
   echo "▶ Configuring branch protection on $DEFAULT_BRANCH (best effort)…"
   gh api --method PUT "repos/${REPO_SLUG}/branches/${DEFAULT_BRANCH}/protection" \
@@ -121,35 +151,17 @@ if [[ -n "$REPO_SLUG" ]]; then
     > /dev/null 2>&1 \
     && echo "  ✓ branch protection set" \
     || echo "  · branch protection skipped (no admin perms, or already set)"
-else
-  echo "▶ Repo has no remote yet; skipping label + branch-protection setup."
-  echo "  After you push, re-run: bpl-init (it's idempotent)."
 fi
 
-# ───────── secrets reminder ─────────
 cat <<EOF
 
-✅ Harness installed.
+✅ CI harness installed (requires API keys to actually run).
 
 Next steps:
-  1. Make sure these user-level secrets exist (only once, ever):
+  1. Set user-level secrets (only once, ever):
        gh secret set ANTHROPIC_API_KEY --user
        gh secret set OPENAI_API_KEY    --user
-
-  2. Review and customize:
-       CLAUDE.md             — fill in project-specific sections
-       .harness.yml          — adjust sensitive_paths / loop limit
-       CODEOWNERS            — confirm @${OWNER} is correct
-
-  3. Commit and push:
-       git add .github CLAUDE.md AGENTS.md CODEOWNERS .harness.yml
-       git commit -m "chore: enable bounded-pr-loop harness"
-       git push
-
-  4. Test it:
-       gh issue create -l claude-implement -t "Test task" -b "Make a no-op change to README"
-
-Calibration mode is ON by default — auto-merge is disabled until you remove
-the \`harness-calibrating\` label from each PR. Live with that for ~10 PRs
-before flipping calibration_mode: false in .harness.yml.
+  2. Commit + push.
+  3. Test:
+       gh issue create -l claude-implement -t "Test task"
 EOF

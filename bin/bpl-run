@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""bpl-run — local bounded PR loop using your Claude Code and Codex subscriptions.
+
+Runs entirely on your Mac. Reads an issue from GitHub, asks `claude` to
+implement it, asks `codex` to review, loops up to N times if Codex finds
+blocking issues, then opens a PR. Uses your installed CLI auth — no API
+keys, no GitHub Actions, no recurring cost.
+
+Usage:
+    cd /path/to/your/repo
+    bpl-run <issue-number> [options]
+
+Options:
+    --auto-merge        Squash-merge after Codex PASS (default: open PR only)
+    --max-loops N       Loop limit (default from .bpl.yml, fallback 3)
+    --model MODEL       Override Claude model (e.g. claude-opus-4-7)
+    --dry-run           Show what would happen; don't actually run claude/codex
+    --skip-secret-scan  Don't run gitleaks locally (default: run if installed)
+
+State is written to .bpl/runs/<issue>.json so you can resume or audit.
+The script reads ~/CLAUDE.md + ~/AGENTS.md (global) and ./CLAUDE.md if
+present (project-specific). No per-project CLAUDE.md is required.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ─── Defaults (overridable in .bpl.yml) ──────────────────────────────
+
+DEFAULT_LOOP_MAX = 3
+DEFAULT_SENSITIVE = [
+    ".github/workflows/**",
+    "**/auth/**",
+    "**/billing/**",
+    "**/migrations/**",
+    "**/secrets/**",
+]
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CODEX_MODEL = "o4-mini"
+BPL_HOME = Path(os.environ.get("BPL_HOME") or
+                Path.home() / "codes/github.com/bounded-pr-loop")
+
+VERDICT_RE = re.compile(r"verdict\s*:\s*(pass|fail)", re.IGNORECASE)
+
+
+# ─── Config + state ─────────────────────────────────────────────────
+
+@dataclass
+class Config:
+    loop_count_max: int = DEFAULT_LOOP_MAX
+    sensitive_paths: list[str] = field(default_factory=lambda: list(DEFAULT_SENSITIVE))
+    claude_model: str = DEFAULT_CLAUDE_MODEL
+    codex_model: str = DEFAULT_CODEX_MODEL
+    calibration_mode: bool = True
+
+    @classmethod
+    def load(cls, path: Path) -> "Config":
+        if not path.exists():
+            return cls()
+        try:
+            import yaml
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyyaml"], check=True)
+            import yaml  # noqa: WPS433
+        data = yaml.safe_load(path.read_text()) or {}
+        return cls(
+            loop_count_max=int(data.get("loop_count_max", DEFAULT_LOOP_MAX)),
+            sensitive_paths=list(data.get("sensitive_paths") or DEFAULT_SENSITIVE),
+            claude_model=data.get("claude_model", DEFAULT_CLAUDE_MODEL),
+            codex_model=data.get("codex_model", DEFAULT_CODEX_MODEL),
+            calibration_mode=bool(data.get("calibration_mode", True)),
+        )
+
+
+@dataclass
+class RunState:
+    issue: int
+    branch: str
+    loop_count: int = 0
+    history: list[dict] = field(default_factory=list)
+    path: Path | None = None
+
+    def log(self, **event) -> None:
+        event["ts"] = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        self.history.append(event)
+        self.save()
+
+    def save(self) -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({
+            "issue": self.issue,
+            "branch": self.branch,
+            "loop_count": self.loop_count,
+            "history": self.history,
+        }, indent=2))
+
+
+# ─── Shell helpers ──────────────────────────────────────────────────
+
+def sh(*args: str, check: bool = True, capture: bool = True, **kw) -> subprocess.CompletedProcess:
+    """Run a subprocess with stable defaults."""
+    return subprocess.run(args, check=check, capture_output=capture, text=True, **kw)
+
+
+def gh(*args: str) -> str:
+    return sh("gh", *args).stdout
+
+
+def git(*args: str) -> str:
+    return sh("git", *args).stdout
+
+
+def repo_root() -> Path:
+    return Path(git("rev-parse", "--show-toplevel").strip())
+
+
+def repo_slug() -> str:
+    return gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").strip()
+
+
+def need_cli(name: str) -> None:
+    if not shutil.which(name):
+        sys.exit(f"❌ `{name}` not on PATH. Install it before running bpl-run.")
+
+
+# ─── Prompt assembly ────────────────────────────────────────────────
+
+def load_review_guide(changed_files: list[str], repo: Path) -> str:
+    """BASE + overlays for detected languages + repo-local extension."""
+    parts: list[str] = [(BPL_HOME / "templates/review-guide/BASE.md").read_text()]
+    langs = detect_languages(changed_files, repo)
+    for lang in langs:
+        overlay = BPL_HOME / "templates/review-guide/overlays" / f"{lang}.md"
+        if overlay.exists():
+            parts.append(f"\n\n## Overlay: {lang}\n\n{overlay.read_text()}")
+    local = repo / "REVIEW_GUIDE.local.md"
+    if local.exists():
+        parts.append(f"\n\n## Repo-local guidance\n\n{local.read_text()}")
+    return "\n".join(parts)
+
+
+def detect_languages(changed_files: list[str], repo: Path) -> list[str]:
+    """Cheap Python port of detect_languages.sh — same logic."""
+    found: set[str] = set()
+    if (repo / "go.mod").exists():        found.add("go")
+    if (repo / "Package.swift").exists(): found.add("swift")
+    if (repo / "Cargo.toml").exists():    found.add("rust")
+    if any((repo / f).exists() for f in
+           ("pyproject.toml", "requirements.txt", "setup.py")): found.add("python")
+    if (repo / "tsconfig.json").exists(): found.add("typescript")
+    if (repo / "package.json").exists() and "typescript" not in found:
+        found.add("javascript")
+    ext_map = {".go": "go", ".swift": "swift", ".rs": "rust", ".py": "python",
+               ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
+               ".jsx": "javascript", ".mjs": "javascript", ".rb": "ruby",
+               ".java": "java", ".kt": "java", ".kts": "java"}
+    for f in changed_files:
+        suffix = Path(f).suffix
+        if suffix in ext_map:
+            if suffix in (".js", ".jsx", ".mjs") and "typescript" in found:
+                continue
+            found.add(ext_map[suffix])
+    return sorted(found)
+
+
+def global_claude_md() -> str:
+    """Read ~/CLAUDE.md + ~/AGENTS.md if present. Symlink loops are tolerated."""
+    pieces = []
+    for path in (Path.home() / "CLAUDE.md",):
+        if path.exists():
+            pieces.append(path.read_text())
+    return "\n".join(pieces)
+
+
+def project_claude_md(repo: Path) -> str:
+    p = repo / "CLAUDE.md"
+    return p.read_text() if p.exists() else ""
+
+
+def implement_prompt(issue: dict, repo: Path) -> str:
+    body = "\n".join([
+        global_claude_md(),
+        project_claude_md(repo),
+        "",
+        "# Task",
+        "",
+        f"Issue #{issue['number']}: {issue['title']}",
+        "",
+        issue.get("body") or "(no description)",
+        "",
+        "# Rules",
+        "",
+        "- Implement only what the issue describes. Do not refactor unrelated code.",
+        "- Add at least one test for new behavior (skip only for purely cosmetic changes).",
+        "- Run the project's tests if a clear command exists; do not push if they fail.",
+        "- Make minimal, scope-respecting changes. If the task seems to require",
+        "  large-scale refactoring, stop and add a comment explaining why instead.",
+    ])
+    return body
+
+
+def fix_prompt(repo: Path, findings: list[str]) -> str:
+    return "\n".join([
+        global_claude_md(),
+        project_claude_md(repo),
+        "",
+        "# You are fixing a PR based on Codex review findings.",
+        "",
+        "## Rules",
+        "",
+        "1. Fix ONLY the blocking findings below. Do not refactor unrelated code.",
+        "2. Do not expand the original scope.",
+        "3. Run tests if they exist; do not commit if they fail.",
+        "",
+        "## Blocking findings",
+        "",
+        *(f"- {f}" for f in findings),
+    ])
+
+
+# ─── Verdict parsing (shared with CI codex_review_gate.py) ──────────
+
+def parse_verdict(text: str) -> tuple[str, list[str]]:
+    matches = VERDICT_RE.findall(text)
+    if not matches:
+        return "FAIL", ["Codex output had no parseable VERDICT line; treating as FAIL."]
+    verdict = matches[-1].upper()
+    findings: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*Blocking findings", s, re.IGNORECASE):
+            in_section = True
+            continue
+        if in_section:
+            if s.startswith("#"):
+                in_section = False
+                continue
+            if re.match(r"^[-*]\s+", s):
+                findings.append(s.lstrip("-* ").strip())
+    if verdict == "FAIL" and not findings:
+        findings = ["Codex returned FAIL with no specific findings."]
+    return verdict, findings
+
+
+# ─── Sensitive-path + secret checks ─────────────────────────────────
+
+def fnmatches(patterns: list[str], path: str) -> bool:
+    import fnmatch
+    return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+
+
+def touches_sensitive(repo: Path, branch: str, patterns: list[str]) -> str | None:
+    changed = git("diff", "--name-only", f"main...{branch}").splitlines()
+    for f in changed:
+        if fnmatches(patterns, f):
+            return f
+    return None
+
+
+def run_gitleaks(repo: Path, branch: str) -> bool:
+    if not shutil.which("gitleaks"):
+        return True  # not installed; skip
+    try:
+        sh("gitleaks", "detect", "--source", str(repo),
+           "--log-opts", f"main..{branch}",
+           "--redact", "--no-banner", check=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+# ─── Agent invocations ──────────────────────────────────────────────
+
+def run_claude(prompt: str, repo: Path, model: str, dry_run: bool) -> None:
+    print(f"\n▶ claude (model={model}) implementing…")
+    if dry_run:
+        print("  (dry-run; would call: claude -p --dangerously-skip-permissions ...)")
+        return
+    # Pass prompt via stdin to avoid argv length limits.
+    proc = subprocess.run(
+        ["claude", "-p", "--dangerously-skip-permissions", "--model", model],
+        input=prompt, cwd=str(repo), text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"❌ claude exited {proc.returncode}")
+
+
+def run_codex(prompt: str, repo: Path, model: str, dry_run: bool) -> str:
+    print(f"\n▶ codex (model={model}) reviewing…")
+    if dry_run:
+        print("  (dry-run; would call: codex exec --model ... <prompt>)")
+        return "VERDICT: PASS\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+        fh.write(prompt)
+        prompt_path = fh.name
+    try:
+        # `codex exec` reads the prompt from argv. We write it to a file and
+        # feed it via stdin redirection, since long prompts blow past argv limits.
+        proc = subprocess.run(
+            ["codex", "exec", "--model", model, "-"],
+            input=prompt, cwd=str(repo),
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 and not proc.stdout:
+            sys.exit(f"❌ codex exited {proc.returncode}: {proc.stderr[:500]}")
+        return proc.stdout
+    finally:
+        os.unlink(prompt_path)
+
+
+# ─── Main loop ──────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("issue", type=int, help="GitHub issue number to implement")
+    p.add_argument("--auto-merge", action="store_true")
+    p.add_argument("--max-loops", type=int, default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--skip-secret-scan", action="store_true")
+    args = p.parse_args()
+
+    for cli in ("git", "gh", "claude", "codex"):
+        need_cli(cli)
+    if not BPL_HOME.exists():
+        sys.exit(f"❌ BPL_HOME not found at {BPL_HOME}. Set $BPL_HOME or clone the harness repo.")
+
+    repo = repo_root()
+    os.chdir(repo)
+    cfg = Config.load(repo / ".bpl.yml")
+    max_loops = args.max_loops or cfg.loop_count_max
+    claude_model = args.model or cfg.claude_model
+
+    # ── Fetch issue ──
+    print(f"▶ Fetching issue #{args.issue} from {repo_slug()}…")
+    issue = json.loads(gh("issue", "view", str(args.issue),
+                          "--json", "number,title,body,labels"))
+
+    # ── Slug + branch ──
+    slug = re.sub(r"[^a-z0-9]+", "-", issue["title"].lower()).strip("-")[:40]
+    branch = f"agent/issue-{args.issue}-{slug}"
+    git("checkout", "-b", branch)
+
+    state = RunState(issue=args.issue, branch=branch,
+                     path=repo / ".bpl/runs" / f"{args.issue}.json")
+    state.log(phase="start", repo=repo_slug())
+
+    # ── Implement ──
+    run_claude(implement_prompt(issue, repo), repo, claude_model, args.dry_run)
+
+    if not git("status", "--porcelain").strip():
+        sys.exit("❌ claude produced no changes; aborting.")
+
+    git("add", "-A")
+    sh("git", "-c", "user.name=bounded-pr-loop[local]",
+       "-c", "user.email=bpl-local@cdcupt.local",
+       "commit", "-m", f"[agent] implement: {issue['title']}\n\nCloses #{args.issue}")
+    state.log(phase="implement", commit=git("rev-parse", "HEAD").strip())
+
+    # ── Loop: review → maybe fix → review ──
+    final_verdict = "FAIL"
+    final_findings: list[str] = []
+    for loop in range(max_loops + 1):  # initial review + up to max fix loops
+        state.loop_count = loop
+
+        # Guards before each loop iteration
+        breach = touches_sensitive(repo, branch, cfg.sensitive_paths)
+        if breach:
+            print(f"⛔ Sensitive path touched: {breach}. Halting.")
+            state.log(phase="halt", reason="sensitive_path", path=breach)
+            break
+
+        if not args.skip_secret_scan and not run_gitleaks(repo, branch):
+            print("⛔ gitleaks detected secrets. Halting.")
+            state.log(phase="halt", reason="secret_leak")
+            break
+
+        # Codex review
+        diff = git("diff", f"main...{branch}")
+        review_guide = load_review_guide(
+            git("diff", "--name-only", f"main...{branch}").splitlines(), repo)
+        review_prompt = f"{review_guide}\n\n---\n\n## PR diff to review\n\n```diff\n{diff}\n```"
+        codex_out = run_codex(review_prompt, repo, cfg.codex_model, args.dry_run)
+        verdict, findings = parse_verdict(codex_out)
+        state.log(phase="review", loop=loop, verdict=verdict, findings=findings)
+        print(f"  → Codex verdict: {verdict} ({len(findings)} finding(s))")
+        final_verdict, final_findings = verdict, findings
+
+        if verdict == "PASS":
+            break
+        if loop >= max_loops:
+            print(f"⛔ Loop limit reached ({max_loops}). Stopping.")
+            state.log(phase="halt", reason="loop_limit")
+            break
+
+        # Fix
+        run_claude(fix_prompt(repo, findings), repo, claude_model, args.dry_run)
+        if not git("status", "--porcelain").strip():
+            print("⚠️  Claude made no changes during fix; stopping loop.")
+            state.log(phase="halt", reason="fix_made_no_changes")
+            break
+        git("add", "-A")
+        sh("git", "-c", "user.name=bounded-pr-loop[local]",
+           "-c", "user.email=bpl-local@cdcupt.local",
+           "commit", "-m", "[agent] fix: address Codex blocking findings")
+        state.log(phase="fix", loop=loop + 1,
+                  commit=git("rev-parse", "HEAD").strip())
+
+    # ── Push + PR ──
+    print("\n▶ Pushing branch…")
+    git("push", "-u", "origin", branch)
+
+    pr_body = [
+        f"Closes #{args.issue}",
+        "",
+        f"Implemented by bounded-pr-loop (local mode). Codex verdict: **{final_verdict}**.",
+        "",
+        f"- Loops used: {state.loop_count} / {max_loops}",
+    ]
+    if final_verdict == "FAIL":
+        pr_body += ["", "### Outstanding blocking findings", ""]
+        pr_body += [f"- {f}" for f in final_findings]
+        pr_body += ["", "⚠️  Loop exhausted without consensus. Human review required."]
+
+    pr_url = gh("pr", "create",
+                "--title", f"[agent] {issue['title']}",
+                "--body", "\n".join(pr_body),
+                "--head", branch).strip()
+    print(f"\n✅ PR opened: {pr_url}")
+
+    if final_verdict == "FAIL":
+        sh("gh", "pr", "edit", pr_url, "--add-label", "needs-human")
+
+    if args.auto_merge and final_verdict == "PASS" and not cfg.calibration_mode:
+        print("▶ Auto-merging…")
+        sh("gh", "pr", "merge", pr_url, "--squash", "--delete-branch")
+    else:
+        print("ℹ️  Not auto-merging (calibration mode on, or --auto-merge not set, "
+              "or verdict != PASS). Review and merge manually.")
+
+    return 0 if final_verdict == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

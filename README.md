@@ -1,51 +1,82 @@
 # bounded-pr-loop
 
-A bounded, auditable PR-based loop where **Claude Code implements**, **Codex reviews**, and **GitHub Actions merges** — only when every gate is green.
+A bounded, auditable loop where **Claude implements**, **Codex reviews**, and you merge only when both agree. Two modes:
 
-Designed so any new repo of yours becomes harness-ready in **one command**.
+- **Local** *(default, recommended)* — runs on your Mac via your Claude Code + Codex **subscriptions**. No API keys, no recurring cost. One `~/CLAUDE.md` is the global source of truth; no per-project CLAUDE.md needed.
+- **CI** — same loop, running in GitHub Actions. Requires `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` (or an OpenRouter key routed via `*_BASE_URL` overrides). Pay-per-call.
 
 ```text
-issue (label: claude-implement)
-        │
-        ▼
-   Claude opens PR                   ┌──────────────────┐
-        │                            │ ≤ 3 repair loops │
-        ▼                            └──────────────────┘
-   Codex reviews ──── FAIL ──► Claude fixes ──┐
-        │                                     │
-       PASS                                   │
-        │     ◄───────────────────────────────┘
-        ▼
-   CI green + no sensitive paths + cost OK
-        │
-        ▼
-   squash-merge
+                        ┌──────────────────┐
+                        │ ≤ 3 repair loops │
+                        └──────────────────┘
+issue → Claude implements → Codex reviews ──FAIL──► Claude fixes ──┐
+                                  │                                 │
+                                 PASS  ◄──────────────────────────  ┘
+                                  │
+                                  ▼
+                       open PR ─► you (or CI) merge
 ```
 
-## Quickstart
-
-In any repo you want under the harness:
+## Quickstart — local mode
 
 ```bash
-# from inside your project
-~/codes/github.com/bounded-pr-loop/bin/bpl-init
-git add .github CLAUDE.md AGENTS.md CODEOWNERS .harness.yml
-git commit -m "chore: enable bounded-pr-loop harness"
-git push
+# one-time setup of a repo:
+cd ~/codes/github.com/<your-repo>
+~/codes/github.com/bounded-pr-loop/bin/bpl-init     # drops .bpl.yml only
 
-# then for any task you want the loop to do:
-gh issue create -l claude-implement -t "Add /healthz endpoint" -b "Description here"
+# for any task:
+gh issue create -t "Add /healthz endpoint" -b "Description here"
+~/codes/github.com/bounded-pr-loop/bin/bpl-run <issue-number>
 ```
 
-That's the whole loop. Walk away; come back to a merged PR or a `needs-human` label.
+`bpl-run` reads `~/CLAUDE.md` (global) + optional `./CLAUDE.md` (project-specific only if you need it), runs `claude` then `codex`, loops up to 3 times, opens a PR. Costs $0 above your existing subscriptions.
+
+## Quickstart — CI mode (only if you want unattended GitHub-Actions-driven runs)
+
+```bash
+gh secret set ANTHROPIC_API_KEY --user
+gh secret set OPENAI_API_KEY    --user
+
+cd ~/codes/github.com/<your-repo>
+~/codes/github.com/bounded-pr-loop/bin/bpl-init --ci
+git add .github CLAUDE.md AGENTS.md CODEOWNERS .harness.yml
+git commit -m "chore: enable bounded-pr-loop (CI mode)"
+git push
+
+gh issue create -l claude-implement -t "Add /healthz" -b "..."
+# walk away; the workflow opens, reviews, and merges the PR
+```
+
+CI mode burns API-rate dollars even though you have subscriptions, because GitHub Actions runners can't OAuth into your accounts. If you only have an OpenRouter key, set:
+
+```bash
+gh secret set ANTHROPIC_BASE_URL --user --body "https://openrouter.ai/api/v1"
+gh secret set OPENAI_BASE_URL    --user --body "https://openrouter.ai/api/v1"
+gh secret set ANTHROPIC_API_KEY  --user --body "<your-openrouter-key>"
+gh secret set OPENAI_API_KEY     --user --body "<your-openrouter-key>"
+```
+
+Both SDKs respect the base-URL override, so one key powers both agents through OpenRouter's proxy.
 
 ## What it does
 
+In **local mode** (default):
+
+| Phase | Actor | Output |
+|---|---|---|
+| Implement | `claude -p --dangerously-skip-permissions` | New branch, commit |
+| Review | `codex exec` against the diff | Inline PASS/FAIL printed; loop continues or halts |
+| Fix | `claude` again, scoped to blocking findings only | New commit on the branch |
+| Open PR | `gh pr create` | PR with verdict in description; `needs-human` label if exhausted |
+| Merge | You (or `--auto-merge` once you trust the loop) | Squash, issue auto-closes via `Closes #N` |
+
+In **CI mode**:
+
 | Phase | Trigger | Actor | Output |
 |---|---|---|---|
-| Implement | Issue labeled `claude-implement` | Claude Code | Feature branch + PR |
+| Implement | Issue labeled `claude-implement` | Claude Code Action | Feature branch + PR |
 | Review | PR opened / synced | Codex CLI | `codex-pass` or `codex-fail` label + finding comment |
-| Fix | `codex-fail` label set | Claude Code | New commit on PR branch |
+| Fix | `codex-fail` label set | Claude Code Action | New commit on PR branch |
 | Merge | All gates green | GitHub | Squash-merge, issue auto-closes |
 | Halt | Loop limit, sensitive path, secret leak | Loop guard | `needs-human` label, no merge |
 
