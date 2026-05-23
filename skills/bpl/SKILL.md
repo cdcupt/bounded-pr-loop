@@ -1,6 +1,6 @@
 ---
 name: bpl
-description: Bounded PR Loop — implement, open PR, Codex reviews via local codex CLI, fix findings, merge. Use when the user asks to add a feature, fix a bug, modify code, or scaffold a new project inside (or about to be inside) a GitHub repository. The skill walks Claude through the 5-phase workflow using its own tools (Bash, Edit, Write); no external script needed.
+description: Bounded PR Loop — open a PR for the change, have Codex review it locally, fix any blocking findings, merge. Fires in TWO flows. (1) Implementer flow — user asks to add/fix/modify/refactor/implement/create-a-new-project and Claude writes the code. (2) Reviewer/push flow — code already exists in the working tree and the user says push/ship/PR/open-a-PR/send-for-review; Claude skips writing and just runs the rest of the loop. Walks Claude through 5 phases using its own tools (Bash, Edit, Write). No external script needed.
 origin: cdcupt/bounded-pr-loop
 ---
 
@@ -12,6 +12,7 @@ You (Claude) follow this 5-phase workflow for any task-shaped code change in a r
 
 Activate **immediately, without asking,** when the user says any of:
 
+**Implementer flow** (Claude writes the code):
 - "Add a feature / endpoint / screen / command…"
 - "Fix this bug / error / failing test…"
 - "Implement this TODO / spec / issue…"
@@ -19,12 +20,22 @@ Activate **immediately, without asking,** when the user says any of:
 - "Refactor this focused area…"
 - "Create a new project that does X" *(see Phase 0 below — slight variant)*
 
-Activate **after a one-line confirmation** when the request is task-shaped but you're not sure whether it fits in one PR.
+**Reviewer/push flow** (code already exists in the working tree; user wants it through the loop):
+- "Push this / push it / push my changes"
+- "Ship it / ship this"
+- "PR this / open a PR for these changes / create a PR"
+- "Review and push / review then ship"
+- "Send this for review"
+- "Commit and push" — *only if* there are real changes to push and they're non-trivial; if it's literally just `git add && git commit && git push` with no review needed, ask the user once whether they want BPL or a plain commit.
+
+In the reviewer/push flow, **skip Phase 1 and start at Phase 2** with whatever is in the working tree (uncommitted) plus any local commits not yet on the remote. The rest of the loop is identical.
+
+Activate **after a one-line confirmation** when the request is task-shaped but you're not sure whether it fits in one PR, or when it's ambiguous whether the user wants BPL vs. a plain git commit.
 
 Do **NOT** activate for:
 
 - Design discussions, exploratory questions, or "how would I…" requests — just answer them.
-- Local experimentation in an uncommitted state where the user hasn't asked for a permanent change.
+- Trivial one-line edits the user explicitly said to just commit ("just commit it", "no need to PR this").
 - Multi-day refactors that obviously won't fit in one PR — propose breaking it into issues first.
 - Repos with no GitHub remote (offer to `gh repo create` first).
 
@@ -60,6 +71,10 @@ If the user asked to create a new project:
 
 ## Phase 1 — Implement
 
+**Skip this phase entirely** if you're in the reviewer/push flow (the user asked to push existing code). Go straight to Phase 2.
+
+For the implementer flow:
+
 1. Compute a branch name: `agent/<short-slug>` (lowercase, hyphens, ≤40 chars from the task description). If there's a linked issue, use `agent/issue-<n>-<slug>`.
 2. `git checkout -b <branch>`.
 3. Make the **smallest change** that satisfies the task. Do not refactor adjacent code, even if it's tempting. If structural change is unavoidable, call it out in the PR description.
@@ -73,10 +88,25 @@ If the user asked to create a new project:
 
 ## Phase 2 — Push & open PR
 
+For the **implementer flow**, the branch and commit already exist from Phase 1. Just:
+
 1. `git push -u origin <branch>`.
-2. `gh pr create --title "[agent] <task title>" --body "<body>"`.
-3. PR body should include `Closes #<n>` when applicable, plus a one-paragraph summary of what changed and why.
-4. **Capture the PR URL and number** — both are needed in later phases.
+2. `gh pr create --title "[agent] <task title>" --body "<body>"` with `Closes #<n>` if applicable plus a one-paragraph summary.
+3. Capture the PR URL and number.
+
+For the **reviewer/push flow**, you need to assemble the branch + commit yourself:
+
+1. If you are currently on the default branch (`main` or `master`), create a new agent branch first:
+   ```bash
+   git checkout -b agent/<slug-derived-from-changes>
+   ```
+   Otherwise you're already on a working branch — keep using it (but prefer to rename via `git branch -m agent/<slug>` so the agent prefix is consistent).
+2. If there are uncommitted changes (`git status --porcelain` non-empty):
+   - Stage everything: `git add -A`.
+   - Generate a meaningful commit message from the diff (read the diff with `git diff --cached`, summarize the change). Use the same `[agent] <type>: …` format. Type is your call based on what changed.
+3. Push and open the PR exactly as in the implementer flow.
+
+If there's an obvious linked issue (the user mentioned `#42` or there's a single open issue whose title matches the change), include `Closes #<n>` in the PR body. Otherwise omit it.
 
 ## Phase 3 — Codex review
 
